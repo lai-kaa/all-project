@@ -1,0 +1,851 @@
+// ==UserScript==
+// @name         抖音视频解析 v5.3（修复标题延迟 + VRChat代理）
+// @namespace    https://bbs.tampermonkey.net.cn/
+// @version      5.3
+// @description  解析抖音视频：播放/下载/VRChat代理，强制同步标题
+// @author       laika (优化 by 助手)
+// @match        https://www.douyin.com/*
+// @match        https://www.iesdouyin.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_notification
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        unsafeWindow
+// @require      https://lf26-cdn-tos.bytecdntp.com/cdn/expire-1-M/jquery/3.2.1/jquery.min.js
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ======================== 配置 ========================
+    const PROXY_BASE = GM_getValue('dy_proxy_base', 'http://10.10.159.117:8765/proxy-raw/');
+    const NOTIFY_TIMEOUT = 120000;
+    const ERROR_TIMEOUT = 15000;
+    const DEBOUNCE_DELAY = 300;
+    const URL_CHECK_INTERVAL = 3000; // 降低轮询频率
+
+    const VIDEO_CDN_WHITELIST = [
+        'douyinvod.com', 'douyin.com/aweme', 'iesdouyin.com',
+        'snssdk.com/video', 'bytedance.com/video', 'bytecdn.cn/video',
+        'bytegecko.com/video', 'douyincdn.com', 'ixigua.com/video', 'amemv.com'
+    ];
+    const STATIC_BLACKLIST = [
+        'bytednsdoc.com', 'fe-static', 'lf3-static',
+        'p3-pc-sign', 'p9-pc-sign', 'p26-sign',
+        'douyinpic.com', 'douyinstatic.com'
+    ];
+
+    let lastUrl = window.location.href;
+    const videoCache = new Map();
+    let currentDownloadAbort = null;
+    let playerBlobUrl = null;
+
+    // ======================== 样式（不变） ========================
+    GM_addStyle(`
+        :root {
+            --dy: rgb(0,174,236); --dy-t: rgba(0,174,236,0.8);
+            --w: #fff; --nb: rgba(28,28,32,0.95);
+        }
+        #dyNotify {
+            position:fixed; bottom:-250px; left:50%; transform:translateX(-50%);
+            width:480px; max-width:94vw; padding:20px; background:var(--nb); color:var(--w);
+            text-align:center; border-radius:16px; box-shadow:0 8px 40px rgba(0,0,0,.6);
+            opacity:0; transition:all .45s cubic-bezier(.4,0,.2,1); z-index:9998;
+            backdrop-filter:blur(14px); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+        }
+        #dyNotify.show { bottom:20px; opacity:1; }
+        #dyNotify.loading { background:rgba(0,174,236,0.5); }
+        #dyNotify.success { background:rgba(0,200,100,0.5); }
+        #dyNotify.error { background:rgba(231,76,60,0.7); }
+
+        .dy-cover-btn {
+            position:absolute; bottom:10px; right:10px; color:var(--w); border:none;
+            border-radius:8px; padding:6px 14px; font-size:13px; font-weight:bold;
+            cursor:pointer; z-index:100; opacity:0; transition:opacity .2s;
+            background:var(--dy-t); backdrop-filter:blur(5px);
+        }
+        *:hover>.dy-cover-btn { opacity:1; }
+
+        .dy-fixed-btn {
+            z-index:999; width:52px; height:52px; color:var(--w); border:none;
+            border-radius:26px; font-size:11px; font-weight:bold; position:fixed;
+            cursor:pointer; background:var(--dy); box-shadow:0 3px 14px rgba(0,0,0,.25);
+            transition:transform .2s,box-shadow .2s;
+        }
+        .dy-fixed-btn:hover { transform:scale(1.08); box-shadow:0 4px 20px rgba(0,174,236,.4); }
+
+        #dyNotify .dy-url-input {
+            width:100%; padding:9px 12px; border-radius:8px; margin-top:10px;
+            border:1px solid rgba(255,255,255,.25); font-size:11px;
+            background:rgba(255,255,255,.08); color:#fff; box-sizing:border-box;
+            word-break:break-all; text-align:left; resize:none;
+        }
+        #dyNotify .dy-btn-row {
+            margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap;
+        }
+        #dyNotify .dy-btn-row button {
+            padding:10px 18px; border:none; border-radius:10px; cursor:pointer;
+            font-weight:bold; font-size:13px; transition:all .2s; white-space:nowrap;
+        }
+        .dy-btn-copy { background:#555; color:#fff; }
+        .dy-btn-copy:hover { background:#777; }
+        .dy-btn-play { background:#25c26e; color:#fff; font-size:15px !important; padding:12px 28px !important; }
+        .dy-btn-play:hover { background:#1ea85c; transform:scale(1.03); }
+        .dy-btn-play:disabled { background:#555; cursor:not-allowed; transform:none; }
+        .dy-btn-dl { background:var(--dy); color:#fff; }
+        .dy-btn-dl:hover { background:rgb(0,140,200); }
+        .dy-btn-dl:disabled { background:#555; cursor:not-allowed; }
+        .dy-btn-proxy { background:#ff6b35; color:#fff; font-size:15px !important; padding:12px 28px !important; }
+        .dy-btn-proxy:hover { background:#e55a2b; }
+
+        #dyNotify .dy-progress-wrap {
+            margin-top:10px; background:rgba(255,255,255,.1); border-radius:6px;
+            height:24px; overflow:hidden; display:none; position:relative;
+        }
+        #dyNotify .dy-progress-bar {
+            height:100%; width:0%; background:linear-gradient(90deg, var(--dy), #25c26e);
+            border-radius:6px; transition:width .2s;
+        }
+        #dyNotify .dy-progress-text {
+            position:absolute; inset:0; line-height:24px; font-size:12px; font-weight:bold;
+            color:#fff; text-shadow:0 1px 3px rgba(0,0,0,.5);
+        }
+
+        #dyPlayerModal {
+            display:none; position:fixed; inset:0; background:rgba(0,0,0,.92);
+            z-index:9999; justify-content:center; align-items:center; flex-direction:column;
+        }
+        #dyPlayerModal.show { display:flex; }
+        #dyPlayerModal .dy-player-close {
+            position:absolute; top:20px; right:30px; color:#fff; font-size:32px;
+            cursor:pointer; z-index:1; width:44px; height:44px; line-height:44px;
+            text-align:center; border-radius:50%; background:rgba(255,255,255,.15);
+            transition:background .2s;
+        }
+        #dyPlayerModal .dy-player-close:hover { background:rgba(255,255,255,.3); }
+        #dyPlayerModal video {
+            max-width:96vw; max-height:88vh; border-radius:8px;
+            box-shadow:0 8px 40px rgba(0,0,0,.6); outline:none; background:#000;
+        }
+        #dyPlayerModal .dy-player-info {
+            color:#fff; margin-top:16px; font-size:13px; opacity:.6;
+        }
+        #dyPlayerModal .dy-player-loading {
+            color:#fff; font-size:18px; display:flex; align-items:center; gap:10px;
+        }
+        #dyPlayerModal .dy-spinner {
+            width:28px; height:28px; border:3px solid rgba(255,255,255,.2);
+            border-top-color:#fff; border-radius:50%; animation:dySpin .8s linear infinite;
+        }
+        @keyframes dySpin { to { transform:rotate(360deg); } }
+    `);
+
+    // ======================== 通知系统（不变） ========================
+    const notify = document.createElement('div');
+    notify.id = 'dyNotify';
+    document.body.appendChild(notify);
+
+    let notifyTimer = null;
+    function showNotify(title, msg, opts = {}) {
+        if (notifyTimer) { clearTimeout(notifyTimer); notifyTimer = null; }
+        if (notify.classList.contains('show')) {
+            notify.classList.remove('show');
+            setTimeout(() => render(), 350);
+        } else render();
+
+        function render() {
+            notify.classList.remove('loading', 'success', 'error');
+            const { type, url, videoId } = opts;
+            let body = '';
+            if (url && type !== 'loading') {
+                const escaped = url.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                body += `<input class="dy-url-input" value="${escaped}" readonly onclick="this.select();document.execCommand('copy')">`;
+                body += `<div class="dy-btn-row">
+                    <button class="dy-btn-play" id="dyPlayBtn">▶️ 浏览器播放</button>
+                    <button class="dy-btn-copy" id="dyCopyBtn">📋 复制直链</button>
+                    <button class="dy-btn-dl" id="dyDlBtn">⬇ 下载文件</button>
+                    <button class="dy-btn-proxy" id="dyProxyBtn">🔗 VRChat代理链接</button>
+                </div>`;
+                body += `<div class="dy-progress-wrap" id="dyProgressWrap">
+                    <div class="dy-progress-bar" id="dyProgressBar"></div>
+                    <div class="dy-progress-text" id="dyProgressText">准备中...</div>
+                </div>`;
+                body += `<p class="dy-hint" style="margin-top:8px;font-size:10px;opacity:.7;line-height:1.5;">
+                    💡 <b>VRChat</b>：需要先启动Python代理<br>
+                    <code style="background:rgba(255,255,255,.1);padding:2px 6px;border-radius:4px;">python vrchat_proxy.py</code><br>
+                    然后用下方按钮复制代理链接，粘贴到VRChat
+                </p>`;
+            }
+            notify.innerHTML = `
+                <h3 style="margin:4px 0;">${title}</h3>
+                <p style="margin:4px 0;font-size:13px;">${msg}</p>
+                ${body}
+            `;
+            if (type === 'loading') notify.classList.add('loading');
+            else if (type === 'success') notify.classList.add('success');
+            else if (type === 'error') notify.classList.add('error');
+            notify.classList.add('show');
+
+            const timeout = type === 'error' ? ERROR_TIMEOUT : NOTIFY_TIMEOUT;
+            notifyTimer = setTimeout(() => { notify.classList.remove('show'); notifyTimer = null; }, timeout);
+
+            setTimeout(() => {
+                const playBtn = document.getElementById('dyPlayBtn');
+                const copyBtn = document.getElementById('dyCopyBtn');
+                const dlBtn = document.getElementById('dyDlBtn');
+                const proxyBtn = document.getElementById('dyProxyBtn');
+                if (playBtn && url) playBtn.addEventListener('click', () => playInBrowser(url, videoId));
+                if (copyBtn && url) copyBtn.addEventListener('click', () => copyText(url, copyBtn));
+                if (dlBtn && url && videoId) dlBtn.addEventListener('click', () => downloadVideo(url, videoId));
+                if (proxyBtn && url) {
+                    proxyBtn.addEventListener('click', () => {
+                        const proxyUrl = PROXY_BASE + encodeURIComponent(url);
+                        copyText(proxyUrl, proxyBtn);
+                        proxyBtn.textContent = '✅ 已复制！粘贴到VRChat';
+                        setTimeout(() => { proxyBtn.textContent = '🔗 VRChat代理链接'; }, 3000);
+                    });
+                }
+            }, 100);
+        }
+    }
+
+    function copyText(text, btn) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+                btn.textContent = '✅ 已复制';
+                setTimeout(() => {
+                    if (btn.id === 'dyProxyBtn') btn.textContent = '🔗 VRChat代理链接';
+                    else btn.textContent = '📋 复制直链';
+                }, 1500);
+            }).catch(() => fallbackCopy(text, btn));
+        } else fallbackCopy(text, btn);
+    }
+
+    function fallbackCopy(text, btn) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;left:-9999px;';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); btn.textContent = '✅ 已复制'; }
+        catch(e) { btn.textContent = '❌ 失败'; }
+        setTimeout(() => { btn.textContent = '📋 复制直链'; }, 1500);
+        document.body.removeChild(ta);
+    }
+
+    // ======================== 浏览器播放（不变） ========================
+    function playInBrowser(videoUrl, videoId) {
+        console.log('[抖音解析] 🎬 开始下载播放:', videoUrl.substring(0, 80) + '...');
+        const playBtn = document.getElementById('dyPlayBtn');
+        if (playBtn) { playBtn.disabled = true; playBtn.textContent = '⏳ 下载中...'; }
+        const progressWrap = document.getElementById('dyProgressWrap');
+        const progressBar = document.getElementById('dyProgressBar');
+        const progressText = document.getElementById('dyProgressText');
+        if (progressWrap) progressWrap.style.display = 'block';
+        if (progressBar) progressBar.style.width = '2%';
+        if (progressText) progressText.textContent = '正在下载视频...';
+        openPlayerModal(null, videoId, true);
+        const startTime = Date.now();
+        currentDownloadAbort = GM_xmlhttpRequest({
+            method: 'GET',
+            url: videoUrl,
+            responseType: 'arraybuffer',
+            timeout: 300000,
+            headers: {
+                'Referer': window.location.href,
+                'Origin': 'https://www.douyin.com',
+                'User-Agent': navigator.userAgent,
+                'Accept': 'video/mp4,video/webm,video/*,*/*',
+            },
+            onprogress: function(evt) {
+                if (evt.lengthComputable && evt.total > 0) {
+                    const pct = Math.round((evt.loaded / evt.total) * 100);
+                    if (progressBar) progressBar.style.width = pct + '%';
+                    const loadedMB = (evt.loaded / 1024 / 1024).toFixed(1);
+                    const totalMB = (evt.total / 1024 / 1024).toFixed(1);
+                    if (progressText) progressText.textContent = `下载中 ${loadedMB}/${totalMB} MB (${pct}%)`;
+                } else if (evt.loaded) {
+                    const mb = (evt.loaded / 1024 / 1024).toFixed(1);
+                    if (progressBar) progressBar.style.width = Math.min(mb * 3, 90) + '%';
+                    if (progressText) progressText.textContent = `下载中 ${mb} MB...`;
+                }
+            },
+            onload: function(resp) {
+                currentDownloadAbort = null;
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                if (progressBar) progressBar.style.width = '100%';
+                if (progressText) progressText.textContent = '处理中...';
+                if (resp.status < 200 || resp.status >= 400) {
+                    handlePlayError(playBtn, `服务器返回 HTTP ${resp.status}（链接可能已过期，请重新解析）`);
+                    return;
+                }
+                if (!resp.response || resp.response.byteLength === 0) {
+                    if (progressText) progressText.textContent = 'GM数据为空，尝试Fetch...';
+                    playViaFetch(videoUrl, videoId, playBtn, progressBar, progressText);
+                    return;
+                }
+                const contentType = (resp.responseHeaders || '').toLowerCase();
+                if (contentType.includes('text/html') || contentType.includes('application/json')) {
+                    handlePlayError(playBtn, '链接已过期，请重新解析');
+                    return;
+                }
+                const mimeType = contentType.includes('video/')
+                    ? contentType.match(/video\/[a-z0-9]+/)?.[0] || 'video/mp4'
+                    : 'video/mp4';
+                const blob = new Blob([resp.response], { type: mimeType });
+                if (playerBlobUrl) URL.revokeObjectURL(playerBlobUrl);
+                playerBlobUrl = URL.createObjectURL(blob);
+                if (progressText) progressText.textContent = `✅ ${(blob.size/1024/1024).toFixed(1)}MB 完成 (${elapsed}s)`;
+                updatePlayBtn(playBtn, true);
+                updatePlayerVideo(playerBlobUrl, videoId);
+                notify.classList.remove('loading');
+                notify.classList.add('success');
+            },
+            onerror: function() {
+                currentDownloadAbort = null;
+                if (progressText) progressText.textContent = 'GM失败，尝试Fetch...';
+                playViaFetch(videoUrl, videoId, playBtn, progressBar, progressText);
+            },
+            ontimeout: function() {
+                currentDownloadAbort = null;
+                if (progressText) progressText.textContent = '超时，尝试Fetch...';
+                playViaFetch(videoUrl, videoId, playBtn, progressBar, progressText);
+            }
+        });
+    }
+
+    function handlePlayError(playBtn, message) {
+        console.error('[抖音解析] ❌', message);
+        updatePlayBtn(playBtn, false);
+        updatePlayerError(message);
+        const progressText = document.getElementById('dyProgressText');
+        if (progressText) progressText.textContent = '❌ ' + message;
+    }
+
+    function updatePlayBtn(btn, success) {
+        if (!btn) return;
+        btn.disabled = false;
+        btn.textContent = success ? '🔄 重新播放' : '🔄 重试';
+    }
+
+    async function playViaFetch(videoUrl, videoId, playBtn, progressBar, progressText) {
+        console.log('[抖音解析] 尝试浏览器 Native Fetch');
+        if (playBtn) { playBtn.disabled = true; playBtn.textContent = '⏳ Fetch中...'; }
+        if (progressText) progressText.textContent = '使用浏览器fetch下载（无进度显示）...';
+        try {
+            const resp = await fetch(videoUrl, {
+                headers: {
+                    'Referer': window.location.href,
+                    'User-Agent': navigator.userAgent,
+                    'Accept': 'video/mp4,video/webm,video/*,*/*'
+                }
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const blob = await resp.blob();
+            if (blob.size === 0) throw new Error('空白视频');
+            if (playerBlobUrl) URL.revokeObjectURL(playerBlobUrl);
+            playerBlobUrl = URL.createObjectURL(blob);
+            if (progressText) progressText.textContent = `✅ Fetch ${(blob.size/1024/1024).toFixed(1)}MB`;
+            if (progressBar) progressBar.style.width = '100%';
+            updatePlayBtn(playBtn, true);
+            updatePlayerVideo(playerBlobUrl, videoId);
+            notify.classList.remove('loading');
+            notify.classList.add('success');
+        } catch(e) {
+            console.error('[抖音解析] Fetch失败:', e);
+            handlePlayError(playBtn, '所有方式均失败，请刷新页面重新解析');
+        }
+    }
+
+    // ======================== 播放器Modal（不变） ========================
+    let playerModal = null;
+    let playerVideo = null;
+
+    function openPlayerModal(blobUrl, videoId, isLoading) {
+        if (playerModal) {
+            if (playerVideo) { playerVideo.pause(); playerVideo.removeAttribute('src'); }
+            playerModal.remove();
+        }
+        playerModal = document.createElement('div');
+        playerModal.id = 'dyPlayerModal';
+        playerModal.className = 'show';
+        if (isLoading) {
+            playerModal.innerHTML = `
+                <span class="dy-player-close" id="dyPlayerClose">&times;</span>
+                <div class="dy-player-loading">
+                    <div class="dy-spinner"></div>
+                    <span>正在下载视频...</span>
+                </div>
+                <div class="dy-player-info" style="margin-top:12px;font-size:11px;">视频ID: ${videoId || '未知'}</div>
+            `;
+        } else if (blobUrl) {
+            playerModal.innerHTML = `
+                <span class="dy-player-close" id="dyPlayerClose">&times;</span>
+                <video id="dyPlayerVideo" controls autoplay crossorigin="anonymous"
+                       style="background:#000;"></video>
+                <div class="dy-player-info">抖音乐享 · 视频ID: ${videoId || '未知'} · 右键可保存视频</div>
+            `;
+        }
+        document.body.appendChild(playerModal);
+        const closeBtn = document.getElementById('dyPlayerClose');
+        function close() {
+            if (playerVideo) { playerVideo.pause(); playerVideo.removeAttribute('src'); playerVideo.load(); }
+            if (playerModal) { playerModal.classList.remove('show'); setTimeout(() => { if (playerModal) playerModal.remove(); playerModal = null; }, 300); }
+        }
+        if (closeBtn) closeBtn.addEventListener('click', close);
+        playerModal.addEventListener('click', function(e) { if (e.target === playerModal) close(); });
+        document.addEventListener('keydown', function escHandler(e) {
+            if (e.key === 'Escape') { close(); document.removeEventListener('keydown', escHandler); }
+        });
+        if (blobUrl) {
+            setTimeout(() => {
+                playerVideo = document.getElementById('dyPlayerVideo');
+                if (playerVideo) { playerVideo.src = blobUrl; playerVideo.load(); playerVideo.play().catch(e => console.log('[抖音解析] 自动播放失败:', e.message)); }
+            }, 100);
+        }
+    }
+
+    function updatePlayerVideo(blobUrl, videoId) {
+        if (!playerModal || !playerModal.classList.contains('show')) { openPlayerModal(blobUrl, videoId, false); return; }
+        const loadingEl = playerModal.querySelector('.dy-player-loading');
+        if (loadingEl) loadingEl.remove();
+        const infoEl = playerModal.querySelector('.dy-player-info');
+        if (infoEl) infoEl.textContent = '抖音乐享 · 视频ID: ' + (videoId || '未知') + ' · 右键可保存视频';
+        let videoEl = playerModal.querySelector('video');
+        if (!videoEl) {
+            videoEl = document.createElement('video');
+            videoEl.id = 'dyPlayerVideo'; videoEl.controls = true; videoEl.autoplay = true;
+            videoEl.crossOrigin = 'anonymous';
+            videoEl.style.cssText = 'background:#000;max-width:96vw;max-height:88vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6);';
+            const closeBtn = playerModal.querySelector('.dy-player-close');
+            if (closeBtn) closeBtn.insertAdjacentElement('afterend', videoEl);
+            else playerModal.appendChild(videoEl);
+        }
+        playerVideo = videoEl;
+        playerVideo.src = blobUrl;
+        playerVideo.load();
+        playerVideo.play().catch(e => console.log('[抖音解析] 自动播放失败:', e.message));
+    }
+
+    function updatePlayerError(msg) {
+        if (!playerModal || !playerModal.classList.contains('show')) return;
+        const loadingEl = playerModal.querySelector('.dy-player-loading');
+        if (loadingEl) loadingEl.innerHTML = `<span>❌ ${msg}</span>`;
+    }
+
+    // ======================== 下载（不变） ========================
+    function downloadVideo(videoUrl, videoId) {
+        console.log('[抖音解析] 开始下载:', videoUrl.substring(0, 80) + '...');
+        notify.classList.add('loading');
+        const dlBtn = document.getElementById('dyDlBtn');
+        if (dlBtn) { dlBtn.disabled = true; dlBtn.textContent = '⏳ 下载中...'; }
+        const progressWrap = document.getElementById('dyProgressWrap');
+        const progressBar = document.getElementById('dyProgressBar');
+        const progressText = document.getElementById('dyProgressText');
+        if (progressWrap) progressWrap.style.display = 'block';
+        if (progressBar) progressBar.style.width = '3%';
+        if (progressText) progressText.textContent = '正在下载...';
+        if (notifyTimer) { clearTimeout(notifyTimer); notifyTimer = null; }
+        currentDownloadAbort = GM_xmlhttpRequest({
+            method: 'GET',
+            url: videoUrl,
+            responseType: 'arraybuffer',
+            timeout: 600000,
+            headers: {
+                'Referer': window.location.href,
+                'Origin': 'https://www.douyin.com',
+                'User-Agent': navigator.userAgent,
+                'Accept': 'video/mp4,video/webm,video/*,*/*',
+            },
+            onprogress: function(evt) {
+                if (evt.lengthComputable && evt.total > 0) {
+                    const pct = 3 + Math.round((evt.loaded / evt.total) * 92);
+                    if (progressBar) progressBar.style.width = pct + '%';
+                    if (progressText) progressText.textContent = `下载中 ${(evt.loaded/1024/1024).toFixed(1)}/${(evt.total/1024/1024).toFixed(1)} MB`;
+                }
+            },
+            onload: function(resp) {
+                currentDownloadAbort = null;
+                if (progressBar) progressBar.style.width = '100%';
+                if (resp.status < 200 || resp.status >= 400) {
+                    downloadFailed(videoUrl, videoId, `HTTP ${resp.status}`);
+                    return;
+                }
+                if (!resp.response || resp.response.byteLength === 0) {
+                    downloadFailed(videoUrl, videoId, '视频数据为空（链接过期，请重新解析）');
+                    return;
+                }
+                const contentType = (resp.responseHeaders || '').toLowerCase();
+                if (contentType.includes('text/html') || contentType.includes('application/json')) {
+                    downloadFailed(videoUrl, videoId, '非视频内容（链接过期）');
+                    return;
+                }
+                const mimeType = contentType.includes('video/')
+                    ? contentType.match(/video\/[a-z0-9]+/)?.[0] || 'video/mp4'
+                    : 'video/mp4';
+                const ext = mimeType.includes('webm') ? 'webm' : 'mp4';
+                const blob = new Blob([resp.response], { type: mimeType });
+                const fileName = `douyin_${videoId}.${ext}`;
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl; a.download = fileName; a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(blobUrl); }, 1500);
+                const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
+                console.log('[抖音解析] ✅ 下载完成:', fileName, sizeMB + 'MB');
+                notify.classList.remove('loading');
+                notify.classList.add('success');
+                if (progressWrap) progressWrap.style.display = 'none';
+                if (dlBtn) { dlBtn.disabled = false; dlBtn.textContent = '✅ 完成'; }
+                const titleEl = notify.querySelector('h3');
+                const msgEl = notify.querySelector('p');
+                if (titleEl) titleEl.textContent = '✅ 下载完成';
+                if (msgEl) msgEl.textContent = `${fileName} (${sizeMB}MB)`;
+                notifyTimer = setTimeout(() => { notify.classList.remove('show'); notifyTimer = null; }, 8000);
+            },
+            onerror: function() {
+                currentDownloadAbort = null;
+                downloadFailed(videoUrl, videoId, '网络请求失败');
+            },
+            ontimeout: function() {
+                currentDownloadAbort = null;
+                downloadFailed(videoUrl, videoId, '下载超时');
+            }
+        });
+    }
+
+    function downloadFailed(videoUrl, videoId, reason) {
+        console.error('[抖音解析] ❌ 下载失败:', reason);
+        notify.classList.remove('loading');
+        notify.classList.add('error');
+        const progressWrap = document.getElementById('dyProgressWrap');
+        if (progressWrap) progressWrap.style.display = 'none';
+        const dlBtn = document.getElementById('dyDlBtn');
+        if (dlBtn) { dlBtn.disabled = false; dlBtn.textContent = '🔄 重试'; }
+        const msgEl = notify.querySelector('p');
+        if (msgEl) msgEl.innerHTML = `下载失败: ${reason}<br>💡 请重新解析获取新链接`;
+        notifyTimer = setTimeout(() => { notify.classList.remove('show'); notifyTimer = null; }, NOTIFY_TIMEOUT);
+    }
+
+    // ======================== URL验证（不变） ========================
+    function isValidVideoUrl(url) {
+        if (!url || typeof url !== 'string' || !url.startsWith('http')) return false;
+        const lower = url.toLowerCase();
+        if (/\.(png|jpg|jpeg|gif|webp|bmp|svg|ico)(\?|$)/i.test(lower)) return false;
+        for (const b of STATIC_BLACKLIST) { if (lower.includes(b)) return false; }
+        for (const w of VIDEO_CDN_WHITELIST) { if (lower.includes(w)) return true; }
+        return false;
+    }
+
+    function cleanVideoUrl(url) {
+        if (!url) return url;
+        let c = url.toString().replace(/wm\./g, '').replace(/watermark/g, '');
+        const qi = c.indexOf('?');
+        if (qi > 0) c = c.substring(0, qi);
+        return c;
+    }
+
+    function debounce(fn, d) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => { fn.apply(this, a); t = null; }, d); }; }
+
+    function extractVideoId() {
+        const u = window.location.href;
+        let m;
+        m = u.match(/modal_id=(\d+)/); if (m) return m[1];
+        m = u.match(/\/video\/(\d+)/); if (m) return m[1];
+        m = u.match(/\/note\/(\d+)/); if (m) return m[1];
+        m = u.match(/\/user\/[^?]+\?modal_id=(\d+)/); if (m) return m[1];
+        m = u.match(/[?&]modal_id=(\d+)/); if (m) return m[1];
+        return null;
+    }
+
+    function extractVideoUrlFromData(data) {
+        if (!data) return null;
+        const item = data.aweme_detail || (data.item_list && data.item_list[0]) || (data.aweme_list && data.aweme_list[0]) || data.data;
+        if (!item || !item.video) return null;
+        const v = item.video;
+        const candidates = [];
+        if (v.download_addr && v.download_addr.url_list) candidates.unshift(...v.download_addr.url_list);
+        if (v.play_addr && v.play_addr.url_list) candidates.push(...v.play_addr.url_list);
+        if (v.play_addr_h264 && v.play_addr_h264.url_list) candidates.push(...v.play_addr_h264.url_list);
+        for (const c of candidates) {
+            if (c && typeof c === 'string' && c.startsWith('http')) {
+                const cl = cleanVideoUrl(c);
+                if (isValidVideoUrl(cl)) return cl;
+            }
+        }
+        return null;
+    }
+
+    function extractVideoIdFromApiData(data) {
+        if (!data) return null;
+        const item = data.aweme_detail || (data.item_list && data.item_list[0]) || (data.aweme_list && data.aweme_list[0]) || data.data;
+        return item ? (item.aweme_id || item.item_id) : null;
+    }
+
+    function cacheFromApiData(data) {
+        const vid = extractVideoIdFromApiData(data);
+        const url = extractVideoUrlFromData(data);
+        if (vid && url && isValidVideoUrl(url)) { videoCache.set(vid, url); console.log('[抖音解析] 缓存:', vid); }
+    }
+
+    // ======================== 网络拦截（不变） ========================
+    function setupInterceptor() {
+        const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (win.fetch) {
+            const orig = win.fetch;
+            win.fetch = function(input, init) {
+                const url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+                const result = orig.apply(this, arguments);
+                if (typeof url === 'string' && (url.includes('aweme/detail') || url.includes('iteminfo'))) {
+                    result.then(r => { if (r && r.ok) r.clone().json().then(d => cacheFromApiData(d)).catch(() => {}); return r; }).catch(() => {});
+                }
+                return result;
+            };
+        }
+        if (win.XMLHttpRequest) {
+            const OX = win.XMLHttpRequest, oO = OX.prototype.open, oS = OX.prototype.send;
+            OX.prototype.open = function(m, url, ...r) { this._dy = url; return oO.apply(this, [m, url, ...r]); };
+            OX.prototype.send = function(...a) {
+                const x = this, u = x._dy || '';
+                if (typeof u === 'string' && (u.includes('aweme/detail') || u.includes('iteminfo'))) {
+                    x.addEventListener('load', () => { if (x.status === 200) try { cacheFromApiData(JSON.parse(x.responseText)); } catch(e) {} });
+                }
+                return oS.apply(this, a);
+            };
+        }
+        console.log('[抖音解析] 拦截器就绪');
+    }
+
+    // ======================== SSR提取（不变） ========================
+    function extractFromSSR() {
+        const el = document.getElementById('RENDER_DATA');
+        if (el && el.textContent) {
+            try {
+                const d = JSON.parse(decodeURIComponent(el.textContent));
+                const url = findVideoInSSR(d);
+                if (url) { console.log('[抖音解析] SSR(#RENDER_DATA)'); return url; }
+            } catch(e) {}
+        }
+        const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (win.__INITIAL_STATE__) {
+            const url = findVideoInSSR(win.__INITIAL_STATE__);
+            if (url) { console.log('[抖音解析] SSR(__INITIAL_STATE__)'); return url; }
+        }
+        return null;
+    }
+
+    function findVideoInSSR(obj, depth = 0) {
+        if (!obj || depth > 20) return null;
+        if (Array.isArray(obj)) {
+            if (obj.length > 0 && typeof obj[0] === 'string' && obj[0].startsWith('http')) {
+                for (const item of obj) {
+                    if (typeof item === 'string' && item.startsWith('http')) {
+                        const c = cleanVideoUrl(item);
+                        if (isValidVideoUrl(c)) return c;
+                    }
+                }
+            }
+            for (const item of obj) { const r = findVideoInSSR(item, depth + 1); if (r) return r; }
+            return null;
+        }
+        if (typeof obj === 'object' && obj !== null) {
+            const keys = Object.keys(obj);
+            const uli = keys.indexOf('url_list');
+            if (uli >= 0) { const r = findVideoInSSR(obj.url_list, depth + 1); if (r) return r; }
+            for (const k of keys) {
+                if (k === 'url_list') continue;
+                if (['constructor','prototype','__proto__','window','document','location','navigator'].includes(k)) continue;
+                try { const r = findVideoInSSR(obj[k], depth + 1); if (r) return r; } catch(e) {}
+            }
+        }
+        return null;
+    }
+
+    function extractFromCache(vid) {
+        if (videoCache.has(vid)) {
+            const url = videoCache.get(vid);
+            if (isValidVideoUrl(url)) { console.log('[抖音解析] 缓存命中:', vid); return url; }
+            videoCache.delete(vid);
+        }
+        return null;
+    }
+
+    function extractFromDOM() {
+        const ve = document.querySelector('video');
+        if (ve && ve.src && ve.src.startsWith('http') && !ve.src.startsWith('blob:')) {
+            const c = cleanVideoUrl(ve.src);
+            if (isValidVideoUrl(c)) return c;
+        }
+        const se = document.querySelector('video source');
+        if (se && se.src && se.src.startsWith('http')) {
+            const c = cleanVideoUrl(se.src);
+            if (isValidVideoUrl(c)) return c;
+        }
+        return null;
+    }
+
+    async function parseWithPageFetch(vid) {
+        const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (!win.fetch) return null;
+        try {
+            const resp = await win.fetch(`https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=${vid}`, {
+                credentials: 'include',
+                headers: { 'Accept': 'application/json', 'Referer': 'https://www.douyin.com/' }
+            });
+            if (!resp.ok) return null;
+            const data = await resp.json();
+            const url = extractVideoUrlFromData(data);
+            if (url && isValidVideoUrl(url)) { videoCache.set(vid, url); return url; }
+        } catch(e) { console.log('[抖音解析] 页面Fetch失败:', e.message); }
+        return null;
+    }
+
+    async function parseWithThirdParty(vid) {
+        const apis = [
+            { url: `https://api.douyin.wtf/api/item/${vid}`, fields: ['video_url','play_url'] },
+            { url: `https://tikwm.com/api/?url=https://www.douyin.com/video/${vid}`, fields: ['data.play_url','data.video_url'] }
+        ];
+        for (const api of apis) {
+            try {
+                const resp = await new Promise((res, rej) => {
+                    GM_xmlhttpRequest({ method:'GET', url:api.url, headers:{'User-Agent':navigator.userAgent}, timeout:8000, onload:res, onerror:rej, ontimeout:rej });
+                });
+                if (resp.status !== 200) continue;
+                const data = JSON.parse(resp.responseText);
+                let url = extractVideoUrlFromData(data);
+                if (!url) {
+                    for (const f of api.fields) {
+                        let v = data;
+                        for (const p of f.split('.')) v = v && v[p];
+                        if (v && typeof v === 'string' && v.startsWith('http')) { url = cleanVideoUrl(v); break; }
+                    }
+                }
+                if (url && isValidVideoUrl(url)) return url;
+            } catch(e) { console.log('[抖音解析] 第三方失败:', api.url, e.message); }
+        }
+        return null;
+    }
+
+    async function parse(videoIdOverride) {
+        const vid = videoIdOverride || extractVideoId();
+        if (!vid) {
+            showNotify('❌ 解析失败', '未找到视频ID，请进入视频详情页或点击封面', { type: 'error' });
+            return;
+        }
+        console.log('[抖音解析] ======== 开始:', vid, '========');
+        let url = null, source = '';
+        url = extractFromCache(vid);
+        if (url) source = '缓存';
+        if (!url) { url = extractFromSSR(); if (url) { source = 'SSR'; videoCache.set(vid, url); } }
+        if (!url) { url = extractFromDOM(); if (url) { source = 'DOM'; videoCache.set(vid, url); } }
+        if (!url) {
+            showNotify('🔍 解析中', '官方API...', { type: 'loading' });
+            url = await parseWithPageFetch(vid);
+            if (url) source = '官方API';
+        }
+        if (!url) {
+            showNotify('🔍 解析中', '第三方...', { type: 'loading' });
+            url = await parseWithThirdParty(vid);
+            if (url) { source = '第三方'; videoCache.set(vid, url); }
+        }
+        if (url && isValidVideoUrl(url)) {
+            console.log('[抖音解析] 🎉 成功:', url.substring(0, 80) + '...');
+            try { await navigator.clipboard.writeText(url); } catch(e) { fallbackCopy(url, { textContent: '' }); }
+            showNotify('✅ 解析成功', `直链已复制（${source}）`, { type: 'success', url, videoId: vid });
+        } else {
+            if (url) console.error('[抖音解析] URL验证失败:', url);
+            showNotify('❌ 解析失败', '所有方式均失败，请刷新重试', { type: 'error' });
+        }
+    }
+
+    // ======================== ⭐ 新增：强制同步标题 ========================
+    function syncTitle() {
+        // 尝试多种常见抖音文案选择器
+        const container = document.querySelector('[data-e2e="video-active"]')
+                       || document.querySelector('.swiper-slide-active')
+                       || document.querySelector('.video-info-detail');
+        if (!container) return;
+        const desc = container.querySelector('[data-e2e="video-desc"]')
+                  || container.querySelector('.desc')
+                  || container.querySelector('.author-name + *');
+        if (desc && desc.textContent.trim()) {
+            document.title = desc.textContent.trim();
+        }
+    }
+
+    // ======================== UI按钮（修改：移除强制position:relative，减轻重排） ========================
+    function createFixedBtn(id, right) {
+        if (document.getElementById(id)) return;
+        const btn = document.createElement('button');
+        btn.id = id; btn.className = 'dy-fixed-btn'; btn.innerHTML = '🎬<br>解析';
+        btn.style.top = right ? '800px' : '100px';
+        btn.style[right ? 'right' : 'left'] = '20px';
+        btn.addEventListener('click', () => parse());
+        document.body.appendChild(btn);
+    }
+
+    function addCoverBtns() {
+        const sels = ['a[href*="/video/"]', 'a[href*="modal_id="]', '.video-card a', '.feed-item a', '[class*="video"] a[href*="douyin.com"]'];
+        sels.forEach(sel => {
+            try {
+                document.querySelectorAll(sel).forEach(link => {
+                    if (link.querySelector('.dy-cover-btn')) return;
+                    if (!link.querySelector('img') && !link.querySelector('video')) return;
+                    const href = link.href;
+                    if (!href || !href.includes('douyin.com')) return;
+                    let vid = null;
+                    const mm = href.match(/modal_id=(\d+)/), vm = href.match(/\/video\/(\d+)/);
+                    if (mm) vid = mm[1]; else if (vm) vid = vm[1]; else return;
+                    // ✅ 不再修改links的position，避免重排
+                    const btn = document.createElement('button');
+                    btn.className = 'dy-cover-btn'; btn.innerText = '🔍 解析'; btn.dataset.id = vid;
+                    btn.addEventListener('click', function(e) { e.preventDefault(); e.stopPropagation(); parse(vid); });
+                    link.appendChild(btn);
+                });
+            } catch(e) {}
+        });
+    }
+
+    // ======================== URL监控（改用事件 + 低频轮询，并触发标题同步） ========================
+    function setupUrlWatch() {
+        const checkUrl = () => {
+            const cur = window.location.href;
+            if (cur !== lastUrl) {
+                console.log('[抖音解析] URL变化:', cur);
+                lastUrl = cur;
+                if (!document.getElementById('videoAnalysis1')) createFixedBtn('videoAnalysis1', true);
+                if (!document.getElementById('videoAnalysis2')) createFixedBtn('videoAnalysis2', false);
+                setTimeout(addCoverBtns, 500);
+                syncTitle();  // 立即更新标题
+            }
+        };
+        // 监听浏览器导航事件
+        window.addEventListener('popstate', checkUrl);
+        window.addEventListener('hashchange', checkUrl);
+        // 后备轮询，间隔拉长到3秒
+        setInterval(checkUrl, URL_CHECK_INTERVAL);
+    }
+
+    function setupShortcut() {
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.shiftKey && e.key === 'D') { e.preventDefault(); parse(); }
+        });
+    }
+
+    // ======================== 初始化 ========================
+    function init() {
+        console.log('[抖音解析] v5.3 启动 | Proxy=' + PROXY_BASE);
+        setupInterceptor();
+        setTimeout(() => { createFixedBtn('videoAnalysis1', true); createFixedBtn('videoAnalysis2', false); }, 1000);
+        addCoverBtns();
+        setupUrlWatch();
+        setupShortcut();
+        const obs = new MutationObserver(debounce(() => addCoverBtns(), DEBOUNCE_DELAY));
+        obs.observe(document.body, { childList: true, subtree: true });
+    }
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+    else init();
+})();
