@@ -1,0 +1,79 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>车票查询 - 中国铁路12306</title>
+    <link rel="stylesheet" href="{% static 'css/ticket.css' %}">
+</head>
+<body>
+    <img src="{% static 'img/标题.png' %}" alt="" class="img">
+    <nav class="nav-bar">
+        <ul>
+            <li><a href="{% url 'home' %}">首页</a></li>
+            <li><a href="{% url 'ticket' %}">车票</a></li>
+            <li><a href="{% url 'my_orders' %}">我的购买</a></li>
+        </ul>
+    </nav>
+    <div class="header"><h1>火车票信息</h1></div>
+
+    <div class="container">
+        <h2>火车票信息</h2>
+
+        {% for train in trains %}
+        <div class="ticket-section">
+            <h3>{{ train.get_train_type_display }}({{ train.number }})</h3>
+            <div class="route-bar">
+                <span class="station">{{ train.qi }}</span>
+                <span class="arrow">→</span>
+                <span class="station">{{ train.mudi }}</span>
+                <span class="time">
+                {{ train.start_time|date:"H:i" }} 出发 &nbsp;·&nbsp; {{ train.end_time|date:"H:i" }} 到达
+                </span>
+            </div>
+
+            <table class="ticket-table">
+                <thead>
+                    <tr>
+                        <th>座位类型</th>
+                        <th>价格</th>
+                        <th>余票</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for seat in train.seats.all %}
+                    <tr>
+                        <td>{{ seat.get_type_display }}</td>
+                        <td>{{ seat.price }}元</td>
+                        <td>{{ seat.number }}</td>
+                    <td>
+                        <form method="post" action="{% url 'buy_ticket' %}">
+                        {% csrf_token %}
+                        <input type="hidden" name="train" value="{{ train.number }}">
+                        <input type="hidden" name="seat" value="{{ seat.type }}">
+                        <input type="hidden" name="price" value="{{ seat.price }}">
+                        <button type="submit" class="purchase-button">购买</button>
+                    </form>
+                    </td>   
+                    </tr>
+                    {% empty %}
+                    <tr><td colspan="4">暂无座位信息</td></tr>
+                    {% endfor %}
+                </tbody>
+                
+            </table>
+        </div>
+        {% empty %}
+        <p>暂无车次</p>
+        {% endfor %}
+    </div>
+
+    <footer>
+        <p><img src="{% static 'img/j.png' %}" alt="">
+        版权所有 ©2008-2025 中国铁道集团有限公司 技术支持：铁旅科技有限公司
+        公安 京公网安备 11010802038392号 | 京ICP备05020493号-4 | ICP证：京B2-20202537 | 营业执照</p>
+    </footer>
+
+</body>
+</html>

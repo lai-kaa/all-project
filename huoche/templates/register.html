@@ -1,0 +1,29 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>注册 - 中国铁路12306</title>
+    <link rel="stylesheet" href="{% static 'css/register.css' %}">
+</head>
+<body>
+    <header class="topbar">
+        <img src="{% static 'img/标题.png' %}" alt="logo" class="logo">
+        <h1>用户注册</h1>
+    </header>
+
+    <main class="card">
+        <form method="post" class="register-form">
+            {% csrf_token %}
+            {{ form.as_p }}
+            <button type="submit" class="btn-primary">立即注册</button>
+        </form>
+        <p class="tip">已有账号？<a href="{% url 'login' %}">直接登录</a></p>
+    </main>
+
+    <footer>
+        <p><img src="{% static 'img/j.png' %}" alt="">
+            版权所有 ©2008-2025 中国铁道集团有限公司</p>
+    </footer>
+</body>
+</html>
